@@ -9,7 +9,7 @@ MODELS = {
 }
 
 def main():
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Load first 2 test items from both formats
     gemma_dataset = load_dataset("json", data_files="dataset_gemma.json")["train"].train_test_split(test_size=0.1, seed=42)

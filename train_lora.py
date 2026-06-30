@@ -56,8 +56,13 @@ def train(model_key: str):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # Detect GPU bfloat16 capability
+    has_bf16 = False
+    if device == "cuda":
+        has_bf16 = torch.cuda.is_bf16_supported()
+
     # MPS and CUDA work best with bfloat16 (smaller memory footprint and fast compute)
-    torch_dtype = torch.bfloat16 if (device == "mps" or device == "cuda") else torch.float32
+    torch_dtype = torch.bfloat16 if (device == "mps" or (device == "cuda" and has_bf16)) else torch.float16 if device == "cuda" else torch.float32
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -97,16 +102,25 @@ def train(model_key: str):
     )
 
     # Gemma models have a huge 256k vocabulary size, leading to extremely large logit tensors.
-    # To prevent MPS out-of-memory (OOM) errors on large sequences, we use a batch size of 1 for functiongemma.
-    if model_key == "functiongemma" and (device == "mps" or device == "cuda"):
+    # To prevent MPS out-of-memory (OOM) errors on large sequences, we use a batch size of 1 for functiongemma on MPS.
+    # For CUDA, we can use larger batch sizes since VRAM capacity is typically larger (e.g. 15GB+ on Google Colab).
+    if device == "cuda":
+        batch_size = 16
+        grad_accum = 1
+    elif model_key == "functiongemma" and device == "mps":
         batch_size = 1
         grad_accum = 16
-    elif device == "mps" or device == "cuda":
+    elif device == "mps":
         batch_size = 8
         grad_accum = 2
     else:
         batch_size = 2
         grad_accum = 8
+
+    # Detect GPU bfloat16 capability for SFTConfig
+    has_bf16 = False
+    if device == "cuda":
+        has_bf16 = torch.cuda.is_bf16_supported()
 
     # 6. SFTConfig (extends TrainingArguments with SFT-specific fields)
     sft_config = SFTConfig(
@@ -119,10 +133,9 @@ def train(model_key: str):
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch",
-        fp16=(device == "cuda"),
-        bf16=(device == "cuda" or device == "mps"),
-        report_to="none",
-        dataloader_pin_memory=False,       # required for MPS
+        fp16=(device == "cuda" and not has_bf16),
+        bf16=has_bf16 or (device == "mps"),
+        dataloader_pin_memory=(device == "cuda"),   # enabled on CUDA for performance, disabled on MPS due to crashes
         # SFT-specific fields
         max_length=max_seq_length,
         packing=False,
@@ -144,6 +157,8 @@ def train(model_key: str):
                 gc.collect()
                 torch.mps.empty_cache()
 
+    callbacks = [MPSCallback()] if device == "mps" else []
+
     trainer = SFTTrainer(
         model=model,
         train_dataset=train_dataset,
@@ -151,7 +166,7 @@ def train(model_key: str):
         peft_config=peft_config,
         processing_class=tokenizer,
         args=sft_config,
-        callbacks=[MPSCallback()],
+        callbacks=callbacks,
     )
 
     # 8. Train
